@@ -1,140 +1,240 @@
 # gemm-kernels
 
-A progressive journey of optimizing CUDA GEMM (General Matrix Multiply) kernels from scratch to peak performance — written in CUDA C++ and benchmarked on real GPU hardware using [Modal](https://modal.com).
+CUDA SGEMM kernels from first principles, benchmarked on remote GPUs with
+[Modal](https://modal.com). The repo is organized so source kernels, target
+benchmark harnesses, and generated logs live in predictable places.
 
-> **Goal:** Start from a naive implementation and step by step optimize it until we get as close to cuBLAS as possible.
+## Layout
 
----
+```text
+gemm-kernels/
+├── kernels/
+│   ├── common/
+│   │   └── utils.cuh
+│   └── sgemm/
+│       ├── kernel_blocktiling_1d.cuh
+│       └── kernel_blocktiling_2d.cuh
+├── benchmarks/
+│   ├── sm75/
+│   │   └── fp32/
+│   │       └── t4/
+│   │           └── kernel_blocktiling_1d.py
+│   └── sm90/
+│       └── fp32/
+│           └── h100/
+│               ├── kernel_blocktiling_2d.py
+│               └── logs/
+│                   └── kernel_blocktiling_2d/
+├── tools/
+│   └── modal_check.py
+└── README.md
+```
 
-## What is GEMM?
+The benchmark path encodes the target:
 
-GEMM computes: **C = α × (A @ B) + β × C**
+```text
+benchmarks/<sm-version>/<precision>/<gpu>/
+```
 
-Where A, B, C are matrices and α, β are scalar values. This is the most fundamental operation in deep learning — every linear layer, attention mechanism, and convolution eventually becomes a GEMM.
+For example, H100 FP32 Hopper runs live in:
 
-Getting GEMM fast = getting your model fast.
+```text
+benchmarks/sm90/fp32/h100/
+```
 
----
+Run artifacts for that target are written below that benchmark folder:
 
-## Hardware
+```text
+benchmarks/sm90/fp32/h100/logs/kernel_blocktiling_2d/run_YYYYMMDD_HHMMSS/
+```
 
-All kernels are benchmarked on:
+`logs/` directories and Python bytecode are ignored by git.
 
-| Property | Value |
-|----------|-------|
-| GPU | NVIDIA Tesla T4 |
-| Architecture | Turing |
-| SM Version | SM 7.5 |
-| FP32 Peak | 8.1 TFLOPS |
-| VRAM | 16 GB |
-| Precision | FP32 (float32) |
+## GEMM
 
-Runs are executed remotely via [Modal](https://modal.com) — no local GPU required.
+SGEMM computes:
 
----
+```text
+C = alpha * (A @ B) + beta * C
+```
+
+For FP32 matrices, the benchmark reports:
+
+```text
+FLOPs  = 2 * M * N * K
+Time   = average CUDA event time over repeated launches
+TFLOPS = FLOPs / time / 1e12
+```
+
+Correctness is checked against `torch.matmul` with `rtol=1e-3` and `atol=1e-3`.
 
 ## Kernels
 
-### `01_kernel_blocktiling_1d.cuh` — 1D Block Tiling
+### `kernels/sgemm/kernel_blocktiling_1d.cuh`
 
-The first real optimization step. Instead of every thread reading from slow global memory independently, we divide the matrices into tiles and load them into fast **shared memory** (the GPU's on-chip scratchpad).
+First shared-memory SGEMM kernel. Each thread computes a vertical strip of
+`TM` output values.
 
-**Key idea:**
-- Output matrix C is divided into `BM × BN` tiles
-- Each thread block computes one tile of C
-- Each thread computes `TM` rows of output (1D tiling)
-- Tiles of A and B are loaded into shared memory and reused
-
-**Parameters:**
-```
-BM = 64   (tile height — rows per block)
-BN = 64   (tile width  — cols per block)
-BK = 8    (tile depth  — K-dimension per iteration)
-TM = 8    (rows each thread computes)
-Threads per block = (BM / TM) × BN = 512
+```text
+BM = 64
+BN = 64
+BK = 8
+TM = 8
+threads/block = (BM / TM) * BN = 512
 ```
 
-**Benchmark on T4 (SM 7.5, FP32):**
+Previously measured on Modal T4:
 
-| Size (M=N=K) | Kernel (ms) | Kernel TFLOPS | cuBLAS (ms) | cuBLAS TFLOPS | % of cuBLAS |
-|---|---|---|---|---|---|
+| Size | Kernel ms | Kernel TFLOPS | cuBLAS ms | cuBLAS TFLOPS | % cuBLAS |
+|---:|---:|---:|---:|---:|---:|
 | 512 | 0.375 | 0.72 | 0.132 | 2.03 | 35.3% |
 | 1024 | 2.443 | 0.88 | 0.752 | 2.86 | 30.8% |
 | 2048 | 10.019 | 1.71 | 4.254 | 4.04 | 42.5% |
 | 4096 | 82.786 | 1.66 | 34.473 | 3.99 | 41.6% |
 
-**Peak reached: ~1.7 TFLOPS (~42% of cuBLAS)**
+Run it with:
 
-**Why it plateaus:**
-- `BK=8` is too small — not enough data reused per shared memory load
-- Single-element loads (no `float4` vectorization)
-- No double buffering or prefetching
-
----
-
-## Optimization Roadmap
-
-```
-Kernel 01 — 1D Block Tiling              ✅ done   ~42% cuBLAS
-Kernel 02 — 2D Block Tiling              🔜 next   ~60% cuBLAS (expected)
-Kernel 03 — Vectorized Loads (float4)    🔜         ~70%
-Kernel 04 — Double Buffering             🔜         ~80%
-Kernel 05 — Warp Tiling                  🔜         ~85%
-Kernel 06 — Tensor Core (WMMA)           🔜         ~95%
+```bash
+modal run benchmarks/sm75/fp32/t4/kernel_blocktiling_1d.py
 ```
 
----
+### `kernels/sgemm/kernel_blocktiling_2d.cuh`
 
-## How to Run
+Second shared-memory SGEMM kernel. Each thread computes a `TM x TN` micro-tile,
+so each block covers a `BM x BN` tile of C.
 
-Kernels are run on Modal (free GPU cloud). No local GPU needed.
+```text
+BM = 64
+BN = 64
+BK = 8
+TM = 8
+TN = 8
+threads/block = (BM / TM) * (BN / TN) = 64
+```
 
-**1. Install Modal:**
+The main kernel handles full tiles. A separate edge kernel handles M/N tails.
+The current implementation assumes benchmarked K values are divisible by `BK=8`;
+K-tail behavior is not patched yet.
+
+Run it with:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/kernel_blocktiling_2d.py
+```
+
+Use a different single-launch profile size:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/kernel_blocktiling_2d.py --profile-size 8192
+```
+
+## Latest H100 FP32 Result
+
+Command:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/kernel_blocktiling_2d.py
+```
+
+Environment:
+
+| Property | Value |
+|---|---|
+| GPU | NVIDIA H100 80GB HBM3 |
+| SMs | 132 |
+| Compute capability | 9.0 |
+| CUDA | 12.4 |
+| PyTorch | 2.4.0 |
+| TF32 | Disabled for benchmark comparison |
+
+Correctness passed for:
+
+| Case | Shape | alpha | beta | Max abs err |
+|---|---:|---:|---:|---:|
+| square_256 | 256x256x256 | 1.0 | 0.0 | 4.96e-05 |
+| square_alpha_beta | 512x512x512 | 1.5 | 0.5 | 1.45e-04 |
+| rectangular | 512x768x256 | 1.0 | 0.0 | 0 |
+| edge_mn_k_multiple_of_bk | 1000x832x504 | 1.0 | 0.0 | 0 |
+
+Benchmark:
+
+| Size | Custom ms | Custom TFLOPS | cuBLAS ms | cuBLAS TFLOPS | % cuBLAS |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 0.0779 | 3.44 | 0.0163 | 16.46 | 20.9% |
+| 1024 | 0.1560 | 13.76 | 0.0562 | 38.19 | 36.0% |
+| 2048 | 0.9721 | 17.67 | 0.3412 | 50.36 | 35.1% |
+| 4096 | 7.4775 | 18.38 | 2.6448 | 51.97 | 35.4% |
+| 8192 | 58.0961 | 18.93 | 21.0749 | 52.17 | 36.3% |
+
+Peak observed: about `18.9 TFLOPS`, or about `36%` of FP32 cuBLAS on H100 with
+TF32 disabled.
+
+## Profiling Notes
+
+The H100 2D harness runs three profiling passes after the benchmark:
+
+- `ncu --set full` over one 4096 kernel launch.
+- `nsys profile` over one 4096 kernel launch using `cudaProfilerStart/Stop`.
+- A PyTorch profiler Chrome trace that can be opened directly in Perfetto UI.
+
+Current Modal behavior:
+
+- NCU fails in this environment with return code `9`:
+  `Failed to prepare kernel for profiling`, `Unknown Error on device 0`, and
+  `No kernels were profiled`. No `.ncu-rep` is produced.
+- NSYS succeeds. For the 4096 launch, it reports one
+  `sgemm_blocktiling_2d_kernel<64,64,8,8,8>` instance taking about `7.47 ms`.
+- Nsight Systems 2026.5 rejects `nsys export --type=perfetto`; the harness
+  writes a Perfetto-compatible `torch_perfetto_trace.json` instead.
+
+Latest local artifacts from the last run:
+
+```text
+benchmarks/sm90/fp32/h100/logs/kernel_blocktiling_2d/run_20261008_004951/
+├── benchmark.json
+├── raw_result.json
+├── summary.json
+└── torch_perfetto_trace.json
+```
+
+Open `torch_perfetto_trace.json` at [ui.perfetto.dev](https://ui.perfetto.dev/).
+
+## Setup
+
+Install and authenticate Modal:
+
 ```bash
 pip install modal
 modal setup
 ```
 
-**2. Run a kernel:**
+Check the Modal CUDA/PyTorch environment:
+
 ```bash
-modal run run_kernel.py
+modal run tools/modal_check.py
 ```
 
-This will:
-- Spin up a T4 GPU on Modal
-- Compile the CUDA kernel via PyTorch's `load_inline`
-- Run correctness checks against PyTorch's `torch.matmul`
-- Benchmark against cuBLAS across multiple matrix sizes
-- Print the full performance report
+## Roadmap
 
----
-
-## How Benchmarking Works
-
-```
-FLOPs  = 2 × M × N × K        (multiply + add per element)
-Time   = average of 50 runs    (measured with CUDA events)
-TFLOPS = FLOPs / time / 10¹²
+```text
+Kernel 01 - 1D block tiling              done
+Kernel 02 - 2D block tiling              benchmarked, ~36% cuBLAS on H100 FP32
+Kernel 03 - vectorized loads             next
+Kernel 04 - double buffering             planned
+Kernel 05 - warp tiling                  planned
+Kernel 06 - tensor cores / WMMA          planned
 ```
 
-Correctness is verified with `torch.allclose(rtol=1e-3, atol=1e-3)` against `torch.matmul`.
+Immediate next work:
 
----
-
-## File Structure
-
-```
-gemm-kernels/
-├── 01_kernel_blocktiling_1d.cuh   # Kernel 01: 1D block tiling
-├── utils.cuh                       # Shared utilities (ceil_div etc.)
-├── run_kernel.py                   # Modal runner + benchmark harness
-└── README.md
-```
-
----
+- Add correct K-tail handling to the 2D kernel.
+- Add vectorized global memory loads where alignment permits.
+- Improve the shared-memory layout to reduce bank conflicts.
+- Keep each new benchmark under `benchmarks/<sm>/<precision>/<gpu>/`.
 
 ## References
 
-- [Simon Boehm — How to Optimize a CUDA Matmul Kernel](https://siboehm.com/articles/22/CUDA-MMM)
-- [NVIDIA CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
-- [cuBLAS Documentation](https://docs.nvidia.com/cuda/cublas/)
+- [Simon Boehm - How to Optimize a CUDA Matmul Kernel](https://siboehm.com/articles/22/CUDA-MMM)
+- [NVIDIA CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
+- [NVIDIA cuBLAS Documentation](https://docs.nvidia.com/cuda/cublas/)
+- [NVIDIA Nsight Systems User Guide](https://docs.nvidia.com/nsight-systems/UserGuide/)

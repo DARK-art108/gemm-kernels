@@ -1,7 +1,9 @@
-import os
+from pathlib import Path
+
 import modal
 
 app = modal.App("sgemm-blocktiling-1d")
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 # Use official PyTorch devel image with CUDA 12.4 and cuDNN 9 (already cached)
 image = modal.Image.from_registry("pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel")
@@ -26,7 +28,7 @@ def benchmark_kernel(kernel_code: str, utils_code: str):
     os.makedirs(inc_dir, exist_ok=True)
     with open(f"{inc_dir}/utils.cuh", "w") as f:
         f.write(utils_code)
-    with open(f"{inc_dir}/01_kernel_blocktiling_1d.cuh", "w") as f:
+    with open(f"{inc_dir}/kernel_blocktiling_1d.cuh", "w") as f:
         f.write(kernel_code)
 
     cpp_source = """
@@ -41,7 +43,7 @@ def benchmark_kernel(kernel_code: str, utils_code: str):
     """
 
     cuda_source = """
-    #include "01_kernel_blocktiling_1d.cuh"
+    #include "kernel_blocktiling_1d.cuh"
     """
 
     print("Compiling CUDA kernel extension...")
@@ -159,11 +161,13 @@ def benchmark_kernel(kernel_code: str, utils_code: str):
 
 @app.local_entrypoint()
 def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(base_dir, "01_kernel_blocktiling_1d.cuh")) as f:
+    kernel_path = REPO_ROOT / "kernels" / "sgemm" / "kernel_blocktiling_1d.cuh"
+    utils_path = REPO_ROOT / "kernels" / "common" / "utils.cuh"
+
+    with kernel_path.open() as f:
         kernel_code = f.read()
-    with open(os.path.join(base_dir, "utils.cuh")) as f:
+    with utils_path.open() as f:
         utils_code = f.read()
 
-    print("Starting Modal job for 01_kernel_blocktiling_1d.cuh...")
+    print(f"Starting Modal job for {kernel_path.name}...")
     benchmark_kernel.remote(kernel_code, utils_code)
