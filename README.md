@@ -12,8 +12,8 @@ gemm-kernels/
 │   ├── common/
 │   │   └── utils.cuh
 │   └── sgemm/
-│       ├── kernel_blocktiling_1d.cuh
-│       └── kernel_blocktiling_2d.cuh
+│       ├── kernel_blocktiling_2d.cuh
+│       └── kernel_vectorized_float4.cuh
 ├── benchmarks/
 │   ├── sm75/
 │   │   └── fp32/
@@ -23,8 +23,10 @@ gemm-kernels/
 │       └── fp32/
 │           └── h100/
 │               ├── kernel_blocktiling_2d.py
+│               ├── kernel_vectorized_float4.py
 │               └── logs/
-│                   └── kernel_blocktiling_2d/
+│                   ├── kernel_blocktiling_2d/
+│                   └── kernel_vectorized_float4/
 ├── tools/
 │   └── modal_check.py
 └── README.md
@@ -121,12 +123,77 @@ Run it with:
 ```bash
 modal run benchmarks/sm90/fp32/h100/kernel_blocktiling_2d.py
 ```
-
 Use a different single-launch profile size:
 
 ```bash
 modal run benchmarks/sm90/fp32/h100/kernel_blocktiling_2d.py --profile-size 8192
 ```
+
+### `kernels/sgemm/kernel_vectorized_float4.cuh`
+
+Vectorized-load SGEMM kernel. Each thread computes an `8 x 8` micro-tile
+while loading four contiguous FP32 values at a time with `float4`.
+
+```text
+BM = 128
+BN = 128
+BK = 8
+TM = 8
+TN = 8
+threads/block = (BM / TM) * (BN / TN) = 256
+```
+
+The launch uses ceiling-divided grids and masks M/N/K edge tiles. Full aligned
+groups of four use `float4`; tail groups use zero-filled scalar loads.
+Correctness and performance are benchmarked on an H100 with FP32 TF32 disabled.
+
+Run it with:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/kernel_vectorized_float4.py
+```
+
+## Latest H100 FP32 Vectorized-Load Result
+
+Command:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/kernel_vectorized_float4.py
+```
+
+Environment:
+
+| Property | Value |
+|---|---|
+| GPU | NVIDIA H100 80GB HBM3 |
+| SMs | 132 |
+| Compute capability | 9.0 |
+| CUDA | 12.4 |
+| PyTorch | 2.4.0 |
+| TF32 | Disabled for benchmark comparison |
+
+Correctness passed for all six cases, including alpha/beta, rectangular, and
+unaligned M/N/K tails. Maximum absolute error was `1.45e-4`.
+
+Benchmark:
+
+| Size | Custom ms | Custom TFLOPS | cuBLAS ms | cuBLAS TFLOPS | % cuBLAS |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 0.1118 | 2.40 | 0.0152 | 17.68 | 13.6% |
+| 1024 | 0.2062 | 10.41 | 0.0542 | 39.64 | 26.3% |
+| 2048 | 0.5900 | 29.12 | 0.3386 | 50.74 | 57.4% |
+| 4096 | 4.7672 | 28.83 | 2.6394 | 52.07 | 55.4% |
+| 8192 | 38.1850 | 28.79 | 21.0683 | 52.19 | 55.2% |
+
+Peak observed: about `29.1 TFLOPS`, or about `57%` of FP32 cuBLAS on H100
+with TF32 disabled.
+
+Results are stored in:
+
+```text
+benchmarks/sm90/fp32/h100/logs/kernel_vectorized_float4/run_20261014_001037/
+```
+
 
 ## Latest H100 FP32 Result
 
@@ -219,7 +286,7 @@ modal run tools/modal_check.py
 ```text
 Kernel 01 - 1D block tiling              done
 Kernel 02 - 2D block tiling              benchmarked, ~36% cuBLAS on H100 FP32
-Kernel 03 - vectorized loads             next
+Kernel 03 - vectorized loads             benchmarked, ~61% cuBLAS on H100 FP32
 Kernel 04 - double buffering             planned
 Kernel 05 - warp tiling                  planned
 Kernel 06 - tensor cores / WMMA          planned
@@ -228,7 +295,6 @@ Kernel 06 - tensor cores / WMMA          planned
 Immediate next work:
 
 - Add correct K-tail handling to the 2D kernel.
-- Add vectorized global memory loads where alignment permits.
 - Improve the shared-memory layout to reduce bank conflicts.
 - Keep each new benchmark under `benchmarks/<sm>/<precision>/<gpu>/`.
 
