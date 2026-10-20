@@ -329,14 +329,9 @@ PyTorch and converted to FP16. All cases passed with `rtol=2e-3` and
 The fused kernel is compared against the following per-element operation:
 
 $$
-y_{m,n}
- =
+y_{m,n} =
 x_{m,n}\,w_n\,g_{m,n}\,\sigma(g_{m,n})
-\times
-\left(
-\frac{1}{N}\sum_{k=0}^{N-1}x_{m,k}^{2}
-+10^{-6}
-\right)^{-1/2}.
+\left(\frac{1}{N}\sum_{k=0}^{N-1}x_{m,k}^{2}+10^{-6}\right)^{-1/2}.
 $$
 
 Benchmark latency:
