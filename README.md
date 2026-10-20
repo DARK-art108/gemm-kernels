@@ -97,7 +97,7 @@ $$
 It then applies RMS normalization using the input row:
 
 $$
-\operatorname{inv\_rms}_m
+\mathrm{inv\_rms}_m
   = \left(\frac{1}{N}\sum_{n=0}^{N-1}x_{m,n}^{2}
     +\varepsilon\right)^{-1/2},
 \qquad \varepsilon=10^{-6},
@@ -106,7 +106,7 @@ $$
 and writes:
 
 $$
-y_{m,n}=s_{m,n}\operatorname{inv\_rms}_m.
+y_{m,n}=s_{m,n}\,\mathrm{inv\_rms}_m.
 $$
 
 The implementation loads FP16 values, performs the products, sigmoid, and
@@ -352,7 +352,7 @@ For this non-matmul operation, latency and speedup are more useful than
 TFLOPS. The benchmark reports a nominal effective bandwidth using:
 
 $$
-B_{\mathrm{nominal}} = 2(3MN+N)\ \text{bytes},
+B_{\mathrm{nominal}} = 2(3MN+N)\ \mathrm{bytes},
 \qquad
 \mathrm{GB/s} =
 \frac{B_{\mathrm{nominal}}}{t_{\mathrm{ms}}\times 10^{6}}.
