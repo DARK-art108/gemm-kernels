@@ -10,7 +10,12 @@ benchmark harnesses, and generated logs live in predictable places.
 gemm-kernels/
 ├── kernels/
 │   ├── common/
+│   │   ├── helpers.cuh
+│   │   ├── reduce.cuh
 │   │   └── utils.cuh
+│   ├── fused/
+│   │   ├── bindings.cuh
+│   │   └── fused_rmsnorm_swiglu.cuh
 │   └── sgemm/
 │       ├── kernel_blocktiling_2d.cuh
 │       └── kernel_vectorized_float4.cuh
@@ -20,6 +25,11 @@ gemm-kernels/
 │   │       └── t4/
 │   │           └── kernel_blocktiling_1d.py
 │   └── sm90/
+│       ├── fp16/
+│       │   └── h100/
+│       │       ├── fused_rmsnorm_swiglu.py
+│       │       └── logs/
+│       │           └── fused_rmsnorm_swiglu/
 │       └── fp32/
 │           └── h100/
 │               ├── kernel_blocktiling_2d.py
@@ -69,6 +79,54 @@ TFLOPS = FLOPs / time / 1e12
 ```
 
 Correctness is checked against `torch.matmul` with `rtol=1e-3` and `atol=1e-3`.
+
+## Fused RMSNorm + SwiGLU
+
+`kernels/fused/fused_rmsnorm_swiglu.cuh` fuses the per-row computation into
+one CUDA launch. For input row $x_m \in \mathbb{R}^{N}$, learned weight
+$w \in \mathbb{R}^{N}$, and gate row $g_m \in \mathbb{R}^{N}$, the kernel
+computes:
+
+$$
+s_{m,n}
+  = x_{m,n}\,w_n\,g_{m,n}\,\sigma(g_{m,n}),
+\qquad
+\sigma(z)=\frac{1}{1+e^{-z}}.
+$$
+
+It then applies RMS normalization using the input row:
+
+$$
+\operatorname{inv\_rms}_m
+  = \left(\frac{1}{N}\sum_{n=0}^{N-1}x_{m,n}^{2}
+    +\varepsilon\right)^{-1/2},
+\qquad \varepsilon=10^{-6},
+$$
+
+and writes:
+
+$$
+y_{m,n}=s_{m,n}\operatorname{inv\_rms}_m.
+$$
+
+The implementation loads FP16 values, performs the products, sigmoid, and
+reduction in FP32, then converts the output back to FP16. Each CUDA block
+processes one row. Threads cooperatively load eight FP16 values at a time
+through `float4`, reduce the row sum in shared memory, and write the fused
+result.
+
+The supporting `helpers.cuh` dependency uses CUDA's `__forceinline__`
+qualifier so the extension compiles with NVCC.
+
+The kernel's vectorized indexing requires `N` to be divisible by `8`. The
+benchmark therefore uses valid `N` values and does not claim arbitrary
+non-multiple-of-eight support.
+
+Run it with:
+
+```bash
+modal run benchmarks/sm90/fp16/h100/fused_rmsnorm_swiglu.py
+```
 
 ## Kernels
 
@@ -235,6 +293,84 @@ Benchmark:
 
 Peak observed: about `18.9 TFLOPS`, or about `36%` of FP32 cuBLAS on H100 with
 TF32 disabled.
+
+## Latest H100 FP16 Fused RMSNorm + SwiGLU Result
+
+Command:
+
+```bash
+modal run benchmarks/sm90/fp16/h100/fused_rmsnorm_swiglu.py
+```
+
+Environment:
+
+| Property | Value |
+|---|---|
+| GPU | NVIDIA H100 80GB HBM3 |
+| SMs | 132 |
+| Compute capability | 9.0 |
+| CUDA | 12.4 |
+| PyTorch | 2.4.0 |
+| Input/output dtype | FP16 |
+| Internal arithmetic | FP32 |
+| Reference | PyTorch eager |
+
+Correctness compares the CUDA output with the same operation evaluated in
+PyTorch and converted to FP16. All cases passed with `rtol=2e-3` and
+`atol=2e-3`:
+
+| Case | M | N | Max abs err | Mean abs err |
+|---|---:|---:|---:|---:|
+| small_rows | 37 | 64 | 0 | 0 |
+| standard | 128 | 4096 | 9.77e-4 | 1.03e-8 |
+| many_rows | 513 | 4096 | 1.95e-3 | 7.07e-9 |
+| wide | 1024 | 8192 | 7.81e-3 | 9.31e-9 |
+
+The fused kernel is compared against the following per-element operation:
+
+$$
+y_{m,n}
+ =
+x_{m,n}\,w_n\,g_{m,n}\,\sigma(g_{m,n})
+\times
+\left(
+\frac{1}{N}\sum_{k=0}^{N-1}x_{m,k}^{2}
++10^{-6}
+\right)^{-1/2}.
+$$
+
+Benchmark latency:
+
+| Shape `(M, N)` | Fused ms | PyTorch eager ms | Speedup | Fused nominal GB/s |
+|---|---:|---:|---:|---:|
+| `(128, 4096)` | 0.00492 | 0.05572 | 11.32x | 640.7 |
+| `(512, 4096)` | 0.00552 | 0.08737 | 15.84x | 2282.7 |
+| `(1024, 4096)` | 0.00854 | 0.14960 | 17.52x | 2948.8 |
+| `(1024, 8192)` | 0.02577 | 0.29451 | 11.43x | 1954.0 |
+
+For this non-matmul operation, latency and speedup are more useful than
+TFLOPS. The benchmark reports a nominal effective bandwidth using:
+
+$$
+B_{\mathrm{nominal}} = 2(3MN+N)\ \text{bytes},
+\qquad
+\mathrm{GB/s} =
+\frac{B_{\mathrm{nominal}}}{t_{\mathrm{ms}}\times 10^{6}}.
+$$
+
+This estimate counts FP16 input, gate, output, and one FP16 weight vector.
+It is not a hardware-counter measurement and does not account for cache
+reuse or all internal traffic.
+
+The current kernel requires `N % 8 == 0` because its vectorized path consumes
+eight FP16 values per thread iteration. The benchmark intentionally uses
+compatible `N` values and does not modify that kernel behavior.
+
+Results are stored in:
+
+```text
+benchmarks/sm90/fp16/h100/logs/fused_rmsnorm_swiglu/run_20261021_004658/
+```
 
 ## Profiling Notes
 
