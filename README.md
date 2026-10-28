@@ -91,27 +91,27 @@ one CUDA launch. For input row $x_m \in \mathbb{R}^{N}$, learned weight
 $w \in \mathbb{R}^{N}$, and gate row $g_m \in \mathbb{R}^{N}$, the kernel
 computes:
 
-$$
+```math
 s_{m,n}
   = x_{m,n}\,w_n\,g_{m,n}\,\sigma(g_{m,n}),
 \qquad
 \sigma(z)=\frac{1}{1+e^{-z}}.
-$$
+```
 
 It then applies RMS normalization using the input row:
 
-$$
+```math
 \mathrm{inv\_rms}_m
   = \left(\frac{1}{N}\sum_{n=0}^{N-1}x_{m,n}^{2}
     +\varepsilon\right)^{-1/2},
 \qquad \varepsilon=10^{-6},
-$$
+```
 
 and writes:
 
-$$
+```math
 y_{m,n}=s_{m,n}\,\mathrm{inv\_rms}_m.
-$$
+```
 
 The implementation loads FP16 values, performs the products, sigmoid, and
 reduction in FP32, then converts the output back to FP16. Each CUDA block
@@ -144,39 +144,39 @@ $c\in\mathbb{R}^{C}$, rotation $\Pi$, residual projection
 $S_{\mathrm{mat}}\in\mathbb{R}^{D\times D}$,
 sign sketch $\sigma$, and residual magnitude $\gamma$, the score is:
 
-$$
+```math
 \widetilde{K}_{s,:}
  =
 c[K_{\mathrm{idx}_{s,:}}]\Pi
  +
 \frac{\sqrt{\pi/2}}{D}\,
 \gamma_s\,\sigma_{s,:}S_{\mathrm{mat}},
-$$
+```
 
-$$
+```math
 \mathrm{scores}_{b,s}
  =
 \sum_{d=0}^{D-1}Q_{b,d}\widetilde{K}_{s,d}.
-$$
+```
 
 The implementation factors the query-side matrix products:
 
-$$
+```math
 A_{b,d}=\sum_{j=0}^{D-1}\Pi_{d,j}Q_{b,j},
 \qquad
 T_{b,d}=\sum_{j=0}^{D-1}S_{\mathrm{mat},d,j}Q_{b,j}.
-$$
+```
 
 Each score then uses:
 
-$$
+```math
 \mathrm{scores}_{b,s}
  =
 \sum_d A_{b,d}\,c[K_{\mathrm{idx}_{s,d}}]
  +
 \frac{\sqrt{\pi/2}}{D}\gamma_s
 \sum_d T_{b,d}\sigma_{s,d}.
-$$
+```
 
 This is a raw score kernel only: it does not apply $1/\sqrt{D}$ scaling,
 softmax, or value-cache multiplication.
@@ -389,11 +389,11 @@ PyTorch and converted to FP16. All cases passed with `rtol=2e-3` and
 
 The fused kernel is compared against the following per-element operation:
 
-$$
+```math
 y_{m,n} =
 x_{m,n}\,w_n\,g_{m,n}\,\sigma(g_{m,n})
 \left(\frac{1}{N}\sum_{k=0}^{N-1}x_{m,k}^{2}+10^{-6}\right)^{-1/2}.
-$$
+```
 
 Benchmark latency:
 
@@ -407,12 +407,12 @@ Benchmark latency:
 For this non-matmul operation, latency and speedup are more useful than
 TFLOPS. The benchmark reports a nominal effective bandwidth using:
 
-$$
+```math
 B_{\mathrm{nominal}} = 2(3MN+N)\ \mathrm{bytes},
 \qquad
 \mathrm{GB/s} =
 \frac{B_{\mathrm{nominal}}}{t_{\mathrm{ms}}\times 10^{6}}.
-$$
+```
 
 This estimate counts FP16 input, gate, output, and one FP16 weight vector.
 It is not a hardware-counter measurement and does not account for cache
@@ -457,7 +457,7 @@ Correctness passed for:
 
 All cases passed with `rtol=2e-4` and `atol=2e-4`. The reference computes:
 
-$$
+```math
 \widetilde{K}_{s,:}
  =
 \mathrm{codebook}[K_{\mathrm{idx}_{s,:}}]\Pi
@@ -468,7 +468,7 @@ $$
 \mathrm{scores}_{b,s}
  =
 \sum_{d=0}^{D-1}Q_{b,d}\widetilde{K}_{s,d}.
-$$
+```
 
 Benchmark latency:
 
