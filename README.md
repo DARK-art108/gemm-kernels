@@ -16,6 +16,8 @@ gemm-kernels/
 │   ├── fused/
 │   │   ├── bindings.cuh
 │   │   └── fused_rmsnorm_swiglu.cuh
+│   ├── attention/
+│   │   └── turboquant_attention.cu
 │   └── sgemm/
 │       ├── kernel_blocktiling_2d.cuh
 │       └── kernel_vectorized_float4.cuh
@@ -34,9 +36,11 @@ gemm-kernels/
 │           └── h100/
 │               ├── kernel_blocktiling_2d.py
 │               ├── kernel_vectorized_float4.py
+│               ├── turboquant_attention.py
 │               └── logs/
 │                   ├── kernel_blocktiling_2d/
-│                   └── kernel_vectorized_float4/
+│                   ├── kernel_vectorized_float4/
+│                   └── turboquant_attention/
 ├── tools/
 │   └── modal_check.py
 └── README.md
@@ -126,6 +130,63 @@ Run it with:
 
 ```bash
 modal run benchmarks/sm90/fp16/h100/fused_rmsnorm_swiglu.py
+```
+
+## TurboQuant KV-Cache Attention
+
+`kernels/attention/turboquant_attention.cu` computes raw attention scores
+against TurboQuant-compressed keys without materializing a dequantized
+`S x D` key matrix.
+
+For query matrix $Q \in \mathbb{R}^{B\times D}$, codebook indices
+$K_{\mathrm{idx}}\in\{0,\ldots,C-1\}^{S\times D}$, codebook
+$c\in\mathbb{R}^{C}$, rotation $\Pi$, residual projection
+$S_{\mathrm{mat}}\in\mathbb{R}^{D\times D}$,
+sign sketch $\sigma$, and residual magnitude $\gamma$, the score is:
+
+$$
+\widetilde{K}_{s,:}
+ =
+c[K_{\mathrm{idx}_{s,:}}]\Pi
+ +
+\frac{\sqrt{\pi/2}}{D}\,
+\gamma_s\,\sigma_{s,:}S_{\mathrm{mat}},
+$$
+
+$$
+\mathrm{scores}_{b,s}
+ =
+\sum_{d=0}^{D-1}Q_{b,d}\widetilde{K}_{s,d}.
+$$
+
+The implementation factors the query-side matrix products:
+
+$$
+A_{b,d}=\sum_{j=0}^{D-1}\Pi_{d,j}Q_{b,j},
+\qquad
+T_{b,d}=\sum_{j=0}^{D-1}S_{\mathrm{mat},d,j}Q_{b,j}.
+$$
+
+Each score then uses:
+
+$$
+\mathrm{scores}_{b,s}
+ =
+\sum_d A_{b,d}\,c[K_{\mathrm{idx}_{s,d}}]
+ +
+\frac{\sqrt{\pi/2}}{D}\gamma_s
+\sum_d T_{b,d}\sigma_{s,d}.
+$$
+
+This is a raw score kernel only: it does not apply $1/\sqrt{D}$ scaling,
+softmax, or value-cache multiplication.
+
+The source is kept unchanged from the submitted solution. The Modal harness
+adds only a C++ binding around the required `extern "C" solve` entry point.
+Run the benchmark with:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/turboquant_attention.py
 ```
 
 ## Kernels
@@ -365,6 +426,75 @@ Results are stored in:
 
 ```text
 benchmarks/sm90/fp16/h100/logs/fused_rmsnorm_swiglu/run_20261021_004658/
+```
+
+## Latest H100 TurboQuant Attention Result
+
+Command:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/turboquant_attention.py
+```
+
+Environment:
+
+| Property | Value |
+|---|---|
+| GPU | NVIDIA H100 80GB HBM3 |
+| SMs | 132 |
+| Compute capability | 9.0 |
+| CUDA | 12.4 |
+| PyTorch | 2.4.0 |
+| Workload | `B=32, S=32768, D=128, C=16` |
+
+Correctness passed for:
+
+| Case | `(B, S, D, C)` | Max abs err | Mean abs err |
+|---|---:|---:|---:|
+| small | `(2, 3, 2, 4)` | 0 | 0 |
+| odd_batch_tokens | `(3, 17, 7, 8)` | `7.15e-7` | `1.69e-7` |
+| medium | `(8, 257, 32, 16)` | `3.81e-6` | `5.66e-7` |
+
+All cases passed with `rtol=2e-4` and `atol=2e-4`. The reference computes:
+
+$$
+\widetilde{K}_{s,:}
+ =
+\mathrm{codebook}[K_{\mathrm{idx}_{s,:}}]\Pi
+ +
+\frac{\sqrt{\pi/2}}{D}\,
+\gamma_s\,\sigma_{s,:}S_{\mathrm{mat}},
+\qquad
+\mathrm{scores}_{b,s}
+ =
+\sum_{d=0}^{D-1}Q_{b,d}\widetilde{K}_{s,d}.
+$$
+
+Benchmark latency:
+
+| Shape `(B, S, D, C)` | Custom solve ms | PyTorch reference ms | Custom / reference |
+|---|---:|---:|---:|
+| `(32, 32768, 128, 16)` | 1.2102 | 0.2414 | `0.20x` |
+
+The custom implementation is correct but is approximately `5.0x` slower than
+the PyTorch reference for this workload. This is an implementation finding,
+not a correctness failure. The current kernel:
+
+1. Allocates and frees the transformed-query buffers `A` and `T` on every
+   `solve` call.
+2. Computes each transformed query coordinate with a serial loop over `D`.
+3. Assigns one thread to each `(batch, token)` score and performs a serial
+   `D`-term accumulation.
+
+The PyTorch reference uses optimized matrix-multiplication and reduction
+kernels. It also materializes the dequantized keys, so the comparison is
+useful as a baseline but is not a like-for-like kernel implementation.
+
+No scaling by $1/\sqrt{D}$, softmax, or value-cache operation is included.
+Results are stored in:
+
+```text
+benchmarks/sm90/fp32/h100/logs/turboquant_attention/run_20261029_003409/
 ```
 
 ## Profiling Notes
