@@ -17,7 +17,9 @@ gemm-kernels/
 │   │   ├── bindings.cuh
 │   │   └── fused_rmsnorm_swiglu.cuh
 │   ├── attention/
-│   │   └── turboquant_attention.cu
+│   │   ├── turboquant_attention.cu
+│   │   └── triton/
+│   │       └── flash_attention.py
 │   └── sgemm/
 │       ├── kernel_blocktiling_2d.cuh
 │       └── kernel_vectorized_float4.cuh
@@ -37,10 +39,12 @@ gemm-kernels/
 │               ├── kernel_blocktiling_2d.py
 │               ├── kernel_vectorized_float4.py
 │               ├── turboquant_attention.py
+│               ├── flash_attention_triton.py
 │               └── logs/
 │                   ├── kernel_blocktiling_2d/
 │                   ├── kernel_vectorized_float4/
-│                   └── turboquant_attention/
+│                   ├── turboquant_attention/
+│                   └── flash_attention_triton/
 ├── tools/
 │   └── modal_check.py
 └── README.md
@@ -187,6 +191,56 @@ Run the benchmark with:
 
 ```bash
 modal run benchmarks/sm90/fp32/h100/turboquant_attention.py
+```
+
+## Triton Flash Attention
+
+`kernels/attention/triton/flash_attention.py` implements a forward-only
+scaled dot-product attention kernel with an online softmax. It computes:
+
+```math
+\mathrm{scores}_{m,n}
+ =
+\frac{Q_mK_n^{T}}{\sqrt{D}},
+\qquad
+P_{m,:}=\mathrm{softmax}(\mathrm{scores}_{m,:}),
+\qquad
+O_m=\sum_nP_{m,n}V_n.
+```
+
+Each Triton program owns `BLOCK_M=16` query rows. It loads those queries once,
+then streams the keys and values in `BLOCK_N=16` chunks. It does not
+materialize the full `M x N` score or probability matrices.
+
+For numerical stability, each query row maintains an online state consisting
+of the running maximum $m$, exponential sum $\ell$, and weighted accumulator
+$a$. For a new score block with maximum $m_{\mathrm{blk}}$, the update is:
+
+```math
+m_{\mathrm{new}}=\max(m,m_{\mathrm{blk}}),
+\qquad
+\alpha=\exp(m-m_{\mathrm{new}}),
+```
+
+```math
+\ell_{\mathrm{new}}
+ =
+\alpha\ell+\sum_n\exp(s_n-m_{\mathrm{new}}),
+\qquad
+a_{\mathrm{new}}
+ =
+\alpha a+\sum_n\exp(s_n-m_{\mathrm{new}})V_n.
+```
+
+The final output is $O=a/\ell$. Query, key, value, and output tensors use
+FP32 in this benchmark. Boundary masks cover non-multiple `M`, `N`, and `D`
+sizes; dimensions above 16 are padded to the next power of two for the
+Triton dot-product reduction.
+
+Run it with:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/flash_attention_triton.py
 ```
 
 ## Kernels
@@ -495,6 +549,69 @@ Results are stored in:
 
 ```text
 benchmarks/sm90/fp32/h100/logs/turboquant_attention/run_20261029_003409/
+```
+
+## Latest H100 Triton Flash Attention Result
+
+Command:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/flash_attention_triton.py
+```
+
+Environment:
+
+| Property | Value |
+|---|---|
+| GPU | NVIDIA H100 80GB HBM3 |
+| SMs | 132 |
+| Compute capability | 9.0 |
+| CUDA | 12.4 |
+| PyTorch | 2.4.0 |
+| Triton | 3.0.0 |
+| Input/output dtype | FP32 |
+
+Correctness compares the Triton output with explicit scaled dot-product
+attention:
+
+```math
+O
+ =
+\mathrm{softmax}\!\left(\frac{QK^{T}}{\sqrt{D}}\right)V.
+```
+
+All non-aligned test cases passed with `rtol=2e-3` and `atol=2e-3`:
+
+| Case | `(M, N, D)` | Max abs err | Mean abs err |
+|---|---:|---:|---:|
+| small_non_multiple | `(7, 13, 8)` | `1.19e-7` | `2.75e-8` |
+| odd_rows | `(35, 67, 32)` | `2.38e-7` | `2.60e-8` |
+| wide_head | `(64, 129, 128)` | `3.13e-7` | `4.58e-8` |
+
+Benchmark latency against PyTorch
+`torch.nn.functional.scaled_dot_product_attention`:
+
+| Shape `(M, N, D)` | Triton ms | PyTorch SDPA ms | Triton / SDPA |
+|---|---:|---:|---:|
+| `(128, 512, 64)` | 0.0546 | 0.0554 | `1.02x` |
+| `(512, 2048, 128)` | 0.3768 | 0.1981 | `0.53x` |
+| `(1024, 4096, 128)` | 0.7516 | 0.3979 | `0.53x` |
+
+The custom kernel is approximately equal to PyTorch SDPA for the smallest
+case, but is approximately `1.9x` slower for the two larger cases. This is
+expected for a first implementation: PyTorch SDPA dispatches to a heavily
+optimized attention backend, while this kernel uses fixed `16 x 16` tiles and
+`num_warps=4` without autotuning or a specialized backward path.
+
+The kernel does not materialize the full `M x N` attention matrix. It keeps
+the running maximum, exponential sum, and weighted value accumulator in
+registers, which provides the flash-attention memory behavior. The current
+benchmark covers forward inference only.
+
+Results are stored in:
+
+```text
+benchmarks/sm90/fp32/h100/logs/flash_attention_triton/run_20261101_211903/
 ```
 
 ## Profiling Notes
