@@ -22,7 +22,8 @@ gemm-kernels/
 │   │       └── flash_attention.py
 │   └── sgemm/
 │       ├── kernel_blocktiling_2d.cuh
-│       └── kernel_vectorized_float4.cuh
+│       ├── kernel_vectorized_float4.cuh
+│       └── kernel_warptiling.cuh
 ├── benchmarks/
 │   ├── sm75/
 │   │   └── fp32/
@@ -38,11 +39,13 @@ gemm-kernels/
 │           └── h100/
 │               ├── kernel_blocktiling_2d.py
 │               ├── kernel_vectorized_float4.py
+│               ├── kernel_warptiling.py
 │               ├── turboquant_attention.py
 │               ├── flash_attention_triton.py
 │               └── logs/
 │                   ├── kernel_blocktiling_2d/
 │                   ├── kernel_vectorized_float4/
+│                   ├── kernel_warptiling/
 │                   ├── turboquant_attention/
 │                   └── flash_attention_triton/
 ├── tools/
@@ -324,6 +327,116 @@ Run it with:
 
 ```bash
 modal run benchmarks/sm90/fp32/h100/kernel_vectorized_float4.py
+```
+
+
+### `kernels/sgemm/kernel_warptiling.cuh`
+
+Warp-level tiled FP32 SGEMM. A block computes a `128 x 128` output tile,
+each warp computes a `64 x 64` tile, and each thread accumulates an `8 x 4`
+register tile.
+
+```math
+\begin{aligned}
+C^{\mathrm{out}}_{m,n}
+&=
+\alpha\sum_{k=0}^{K-1}A_{m,k}B_{k,n}
++\beta C^{\mathrm{in}}_{m,n},\\
+(B_M,B_N,B_K)
+&=(128,128,16),\\
+(W_M,W_N)
+&=(64,64).
+\end{aligned}
+```
+
+The implementation uses `float4` loads and stores. It requires `M` and `N`
+to be divisible by `128`, and `K` to be divisible by `16`; the benchmark
+therefore uses only tile-aligned shapes.
+
+```text
+BM = 128
+BN = 128
+BK = 16
+WM = 64
+WN = 64
+WNITER = 4
+TM = 8
+TN = 4
+threads/block = 128
+```
+
+Run it with:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/kernel_warptiling.py
+```
+
+## Latest H100 FP32 Warp-Tiling Result
+
+Command:
+
+```bash
+modal run benchmarks/sm90/fp32/h100/kernel_warptiling.py
+```
+
+Environment:
+
+| Property | Value |
+|---|---|
+| GPU | NVIDIA H100 80GB HBM3 |
+| SMs | 132 |
+| Compute capability | 9.0 |
+| CUDA | 12.4 |
+| PyTorch | 2.4.0 |
+| Input/output dtype | FP32 |
+| TF32 | Disabled for benchmark comparison |
+
+Kernel configuration:
+
+| Parameter | Value |
+|---|---:|
+| Block tile `(B_M,B_N,B_K)` | `(128,128,16)` |
+| Warp tile `(W_M,W_N)` | `(64,64)` |
+| Thread tile `(T_M,T_N)` | `(8,4)` |
+| Threads per block | 128 |
+
+Correctness passed for all four aligned cases with `rtol=1e-3` and
+`atol=1e-3`:
+
+| Case | Shape `(M,N,K)` | alpha | beta | Max abs err | Mean abs err |
+|---|---:|---:|---:|---:|---:|
+| single_block | `(128,128,128)` | 1.0 | 0.0 | `0` | `0` |
+| square_alpha_beta | `(256,256,256)` | 1.5 | 0.5 | `7.63e-5` | `5.44e-6` |
+| rectangular_aligned | `(512,768,256)` | 1.0 | 0.0 | `0` | `0` |
+| multi_block_aligned | `(1024,640,512)` | 0.75 | 0.0 | `9.54e-5` | `5.51e-6` |
+
+The benchmark compares the custom kernel with FP32 PyTorch `torch.matmul`,
+which dispatches to cuBLAS under the same TF32-disabled setting:
+
+| Size | Custom ms | Custom TFLOPS | cuBLAS ms | cuBLAS TFLOPS | % cuBLAS |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 0.0817 | 3.28 | 0.0156 | 17.19 | 19.1% |
+| 1024 | 0.1565 | 13.73 | 0.0569 | 37.74 | 36.4% |
+| 2048 | 0.4945 | 34.74 | 0.3414 | 50.32 | 69.1% |
+| 4096 | 3.7733 | 36.42 | 2.6498 | 51.87 | 70.2% |
+| 8192 | 26.9164 | 40.85 | 21.2127 | 51.83 | 78.8% |
+
+For the measured sizes, the peak result was `40.85 TFLOPS`, or `78.8%` of
+the FP32 cuBLAS throughput. The comparison uses:
+
+```math
+\mathrm{TFLOPS}
+=
+\frac{2MNK}{t_{\mathrm{ms}}\times 10^{9}}.
+```
+
+The result is valid only for aligned dimensions. Non-aligned dimensions are
+rejected by the kernel's divisibility checks rather than masked.
+
+Results are stored in:
+
+```text
+benchmarks/sm90/fp32/h100/logs/kernel_warptiling/run_20261106_014516/
 ```
 
 ## Latest H100 FP32 Vectorized-Load Result
@@ -666,7 +779,7 @@ Kernel 01 - 1D block tiling              done
 Kernel 02 - 2D block tiling              benchmarked, ~36% cuBLAS on H100 FP32
 Kernel 03 - vectorized loads             benchmarked, ~61% cuBLAS on H100 FP32
 Kernel 04 - double buffering             planned
-Kernel 05 - warp tiling                  planned
+Kernel 05 - warp tiling                  benchmarked, ~79% cuBLAS on H100 FP32
 Kernel 06 - tensor cores / WMMA          planned
 ```
 
