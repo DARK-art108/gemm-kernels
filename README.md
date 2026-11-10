@@ -23,7 +23,8 @@ gemm-kernels/
 │   └── sgemm/
 │       ├── kernel_blocktiling_2d.cuh
 │       ├── kernel_vectorized_float4.cuh
-│       └── kernel_warptiling.cuh
+│       ├── kernel_warptiling.cuh
+│       └── kernel_warptiling_multidtype.cuh
 ├── benchmarks/
 │   ├── sm75/
 │   │   └── fp32/
@@ -33,8 +34,10 @@ gemm-kernels/
 │       ├── fp16/
 │       │   └── h100/
 │       │       ├── fused_rmsnorm_swiglu.py
+│       │       ├── kernel_warptiling_multidtype.py
 │       │       └── logs/
-│       │           └── fused_rmsnorm_swiglu/
+│       │           ├── fused_rmsnorm_swiglu/
+│       │           └── kernel_warptiling_multidtype/
 │       └── fp32/
 │           └── h100/
 │               ├── kernel_blocktiling_2d.py
@@ -437,6 +440,132 @@ Results are stored in:
 
 ```text
 benchmarks/sm90/fp32/h100/logs/kernel_warptiling/run_20261106_014516/
+```
+
+
+### `kernels/sgemm/kernel_warptiling_multidtype.cuh`
+
+This is the FP16/BF16 version of the warp-tiled SGEMM kernel. It keeps the
+same `128 x 128` block tile, `64 x 64` warp tile, and `8 x 4` thread tile as
+the FP32 implementation. Inputs and outputs use one 16-bit type, while every
+thread accumulates its partial result in FP32.
+
+```math
+\begin{aligned}
+C^{\mathrm{out}}_{m,n}
+&=
+\mathrm{cast}_{T}\!\left(
+\alpha\sum_{k=0}^{K-1}
+\mathrm{float}(A_{m,k})\,
+\mathrm{float}(B_{k,n})
++\beta\,\mathrm{float}(C^{\mathrm{in}}_{m,n})
+\right),\\
+T&\in\{\mathrm{FP16},\mathrm{BF16}\}.
+\end{aligned}
+```
+
+The kernel uses `half2` or `nv_bfloat162` for two-value vectorized memory
+operations. The final store rounds the FP32 result back to FP16 or BF16.
+This implementation does not use WMMA or explicit Tensor Core instructions.
+
+```text
+BM = 128
+BN = 128
+BK = 16
+WM = 64
+WN = 64
+WNITER = 4
+TM = 8
+TN = 4
+threads/block = 128
+```
+
+It requires contiguous tensors and dimensions aligned to the tile sizes:
+`M` and `N` must be divisible by `128`, and `K` must be divisible by `16`.
+
+Run it with:
+
+```bash
+modal run benchmarks/sm90/fp16/h100/kernel_warptiling_multidtype.py
+```
+
+## Latest H100 FP16/BF16 Warp-Tiling Result
+
+Command:
+
+```bash
+modal run benchmarks/sm90/fp16/h100/kernel_warptiling_multidtype.py
+```
+
+Environment:
+
+| Property | Value |
+|---|---|
+| GPU | NVIDIA H100 80GB HBM3 |
+| SMs | 132 |
+| Compute capability | 9.0 |
+| CUDA | 12.4 |
+| PyTorch | 2.4.0 |
+| TF32 | Disabled |
+| Accumulator | FP32 |
+
+Correctness compares the custom output against an FP32 matrix multiplication
+cast to the tested output type. All eight cases passed with `rtol=2e-2` and
+`atol=2e-2`.
+
+FP16:
+
+| Case | Shape `(M,N,K)` | alpha | beta | Max abs err | Mean abs err |
+|---|---:|---:|---:|---:|---:|
+| single_block | `(128,128,128)` | 1.0 | 0.0 | `0` | `0` |
+| square_alpha_beta | `(256,256,256)` | 1.5 | 0.5 | `3.13e-2` | `3.90e-6` |
+| rectangular_aligned | `(512,768,256)` | 1.0 | 0.0 | `0` | `0` |
+| multi_block_aligned | `(1024,640,512)` | 0.75 | 0.0 | `3.13e-2` | `5.14e-6` |
+
+BF16:
+
+| Case | Shape `(M,N,K)` | alpha | beta | Max abs err | Mean abs err |
+|---|---:|---:|---:|---:|---:|
+| single_block | `(128,128,128)` | 1.0 | 0.0 | `0` | `0` |
+| square_alpha_beta | `(256,256,256)` | 1.5 | 0.5 | `2.50e-1` | `4.77e-6` |
+| rectangular_aligned | `(512,768,256)` | 1.0 | 0.0 | `0` | `0` |
+| multi_block_aligned | `(1024,640,512)` | 0.75 | 0.0 | `1.25e-1` | `1.52e-6` |
+
+The performance comparison uses `torch.matmul` with the same input dtype.
+On H100, this reference uses a highly optimized low-precision backend with
+Tensor Core support; the custom kernel uses ordinary warp-level multiply-add
+instructions and is not a Tensor Core implementation.
+
+| Dtype | Size | Custom ms | Custom TFLOPS | `torch.matmul` ms | Reference TFLOPS | % reference |
+|---|---:|---:|---:|---:|---:|---:|
+| FP16 | 512 | 0.0973 | 2.76 | 0.0144 | 18.63 | 14.8% |
+| FP16 | 1024 | 0.1864 | 11.52 | 0.0098 | 220.09 | 5.2% |
+| FP16 | 2048 | 0.6010 | 28.59 | 0.0290 | 593.31 | 4.8% |
+| FP16 | 4096 | 4.5582 | 30.15 | 0.2250 | 610.77 | 4.9% |
+| FP16 | 8192 | 35.0151 | 31.40 | 1.5194 | 723.66 | 4.3% |
+| BF16 | 512 | 0.1068 | 2.51 | 0.0103 | 26.02 | 9.7% |
+| BF16 | 1024 | 0.2049 | 10.48 | 0.0221 | 97.08 | 10.8% |
+| BF16 | 2048 | 0.6493 | 26.46 | 0.0294 | 583.50 | 4.5% |
+| BF16 | 4096 | 4.7040 | 29.22 | 0.1971 | 697.30 | 4.2% |
+| BF16 | 8192 | 36.5767 | 30.06 | 1.4208 | 773.86 | 3.9% |
+
+The custom kernel reaches `31.40 TFLOPS` for FP16 and `30.06 TFLOPS` for
+BF16 at size `8192`. The throughput calculation is:
+
+```math
+\mathrm{TFLOPS}
+=
+\frac{2MNK}{t_{\mathrm{ms}}\times 10^{9}}.
+```
+
+The low percentage against `torch.matmul` is expected: the comparison path
+uses H100 Tensor Core acceleration, while this kernel currently demonstrates
+the data-type conversion and warp-tiling structure without Tensor Core MMA.
+
+Results are stored in:
+
+```text
+benchmarks/sm90/fp16/h100/logs/kernel_warptiling_multidtype/run_20261110_235640/
 ```
 
 ## Latest H100 FP32 Vectorized-Load Result
